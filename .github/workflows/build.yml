@@ -1,0 +1,173 @@
+name: Build Multi-Platform Binaries
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一分支/标签的新提交会取消上一轮仍在进行的构建，避免浪费配额。
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 与 Dockerfile 保持一致：避免代理抖动时去拉额外 toolchain；依赖走国内代理兜底。
+  GOTOOLCHAIN: local
+  GOPROXY: https://goproxy.cn,direct
+  GOWORK: off
+
+jobs:
+  # 前端资源是平台无关的，只构建一次，打包成单文件供后续矩阵任务复用。
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm ci --registry=https://registry.npmmirror.com
+
+      - name: 构建前端静态资源
+        working-directory: web
+        run: npm run build
+
+      - name: 打包前端资源（单个文件，避免目录传输的层级问题）
+        run: tar -C internal/api/web -czf web-dist.tar.gz .
+
+      - name: 上传前端资源
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web-dist.tar.gz
+          if-no-files-found: error
+
+  # 交叉编译出各平台可执行文件。
+  build-binaries:
+    needs: build-web
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux —— 启用 FUSE。Dockerfile 已验证 CGO_ENABLED=0 + -tags fuse 可正常编译。
+          - goos: linux
+            goarch: amd64
+            build_tags: fuse
+          - goos: linux
+            goarch: arm64
+            build_tags: fuse
+          # 如需兼容旧 32 位 / 老 NAS，取消下面两行注释（需自行确认 go-fuse 对 386/arm 的支持）。
+          # - { goos: linux, goarch: 386, goarm: "", build_tags: fuse }
+          # - { goos: linux, goarch: arm, goarm: "7", build_tags: fuse }
+
+          # macOS —— 为在 Linux runner 上稳定交叉编译，这里不带 fuse（macFUSE 需本地 -tags fuse 构建）。
+          - goos: darwin
+            goarch: amd64
+            build_tags: ""
+          - goos: darwin
+            goarch: arm64
+            build_tags: ""
+
+          # Windows —— 原生无 FUSE，使用 stub 实现。
+          - goos: windows
+            goarch: amd64
+            build_tags: ""
+          - goos: windows
+            goarch: arm64
+            build_tags: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 下载前端资源
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: .
+
+      - name: 解压前端资源到内嵌目录
+        run: |
+          rm -rf internal/api/web
+          mkdir -p internal/api/web
+          tar -C internal/api/web -xzf web-dist.tar.gz
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 编译
+        id: build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          BUILD_TAGS: ${{ matrix.build_tags }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+
+          suffix=""
+          if [ "$GOOS" = "windows" ]; then suffix=".exe"; fi
+
+          out="dist/litepan-${GOOS}-${GOARCH}"
+          if [ "$GOARCH" = "arm" ]; then out="${out}v${GOARM}"; fi
+          out="${out}${suffix}"
+
+          mkdir -p dist
+          # BUILD_TAGS 为空时不传 -tags，避免编译失败。
+          go build -trimpath -ldflags="-s -w" \
+            ${BUILD_TAGS:+-tags "$BUILD_TAGS"} \
+            -o "$out" ./cmd/litepan
+
+          echo "binary=$out" >> "$GITHUB_OUTPUT"
+          ls -lh "$out"
+
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: litepan-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ steps.build.outputs.binary }}
+          if-no-files-found: error
+
+  # 仅在 tag（v*）推送时生成 Release 并附带所有平台二进制与校验和。
+  release:
+    needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载所有二进制
+        uses: actions/download-artifact@v4
+        with:
+          pattern: litepan-*
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 SHA256 校验和
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
