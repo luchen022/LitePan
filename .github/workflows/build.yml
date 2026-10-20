@@ -173,7 +173,7 @@ jobs:
           # 对于 main，生成自动版本标签并绑定本次构建的准确 commit。
           # 对于 v* 标签，保持原有的正式版本发布行为。
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('auto-build-{0}', github.run_id) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Automated build #{0}', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Automated build {0}', github.run_number) }}
           target_commitish: ${{ github.sha }}
           prerelease: ${{ github.ref_type != 'tag' }}
           make_latest: ${{ github.ref_type == 'tag' && 'true' || 'false' }}
