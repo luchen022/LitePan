@@ -147,10 +147,11 @@ jobs:
           path: ${{ steps.build.outputs.binary }}
           if-no-files-found: error
 
-  # 仅在 tag（v*）推送时生成 Release 并附带所有平台二进制与校验和。
+  # main 自动创建唯一的快照预发布；v* tag 创建正式 Release。
+  # 使用 run_id 作为自动标签，避免覆盖旧版，也避免产生重名标签。
   release:
     needs: build-binaries
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: 下载所有二进制
@@ -166,8 +167,15 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: 创建 GitHub Release
+      - name: 创建 GitHub Release（main 为自动预发布，版本标签为正式版）
         uses: softprops/action-gh-release@v2
         with:
+          # 对于 main，生成自动版本标签并绑定本次构建的准确 commit。
+          # 对于 v* 标签，保持原有的正式版本发布行为。
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('auto-build-{0}', github.run_id) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Automated build #{0}', github.run_number) }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          make_latest: ${{ github.ref_type == 'tag' && 'true' || 'false' }}
           files: dist/*
           generate_release_notes: true
